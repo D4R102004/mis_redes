@@ -28,3 +28,24 @@ Link al repo de github que contiene la solución propuesta
 
 Fecha de entrega 12 de octubre 11:59:59 pm
 
+## Quick test using Docker (bridge, privileged) — recommended for laptops on Wi‑Fi
+
+If you can't or don't want to create a macvlan network (common on Wi‑Fi), use the provided
+`docker-compose.bridge.yml` which runs two privileged containers that can open raw sockets.
+
+Build and run (in the repo root):
+
+	docker compose -f docker-compose.bridge.yml build
+	sudo docker compose -f docker-compose.bridge.yml up
+
+Open two new terminals and run the CLI in each container:
+
+	docker exec -it linkchat_node_a python3 -u linkchat/cli.py
+	docker exec -it linkchat_node_b python3 -u linkchat/cli.py
+
+Then in each CLI: `iface` → choose interface (0) → `start` on one of them, and from the other `send <MAC_of_first> <message>`.
+
+When finished, stop with Ctrl+C and remove containers with:
+
+	docker compose -f docker-compose.bridge.yml down
+

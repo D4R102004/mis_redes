@@ -16,7 +16,7 @@ import time
 
 from .frame import mac_bytes_to_str
 from .receiver import receive_frames, print_handler
-from .sender import send_text
+from .sender import send_text, send_file
 
 
 def get_interfaces():
@@ -129,6 +129,19 @@ class CLI:
                 dst = parts[1]
                 msg = parts[2]
                 self.send(dst, msg)
+                continue
+            if c == 'send-file':
+                # usage: send-file <mac> <path>
+                if len(parts) < 3:
+                    print('Usage: send-file <mac> <path>')
+                    continue
+                dst = parts[1]
+                path = parts[2]
+                try:
+                    send_file(dst, self.iface_mac, path, interface=self.iface)
+                    print('File sent (best-effort)')
+                except Exception as e:
+                    print('send-file error:', e)
                 continue
             print('Unknown command: ', c)
 

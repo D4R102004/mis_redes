@@ -1,0 +1,26 @@
+version: '3.8'
+services:
+  nodeA:
+    build: .
+    container_name: linkchat_node_a
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    network_mode: "service:macvlan_net"
+    command: ["cli"]
+    tty: true
+
+  nodeB:
+    build: .
+    container_name: linkchat_node_b
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    network_mode: "service:macvlan_net"
+    command: ["cli"]
+    tty: true
+
+networks:
+  macvlan_net:
+    external: true
+    name: linkchat_macvlan
