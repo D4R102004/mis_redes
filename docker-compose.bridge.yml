@@ -1,0 +1,17 @@
+services:
+  nodea:
+    build: .
+    container_name: linkchat_node_a
+    privileged: true
+    network_mode: bridge
+    command: ["sleep", "infinity"]
+    tty: true
+
+  nodeb:
+    build: .
+    container_name: linkchat_node_b
+    privileged: true
+    network_mode: bridge
+    command: ["sleep", "infinity"]
+    tty: true
+
