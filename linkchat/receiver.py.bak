@@ -85,31 +85,11 @@ def receive_frames(interface="eth0", handler=None):
     finally:
         s.close()
 
-def _get_local_macs():
-    """Return a set of MAC strings for all local interfaces (lowercase)."""
-    import os
-    macs = set()
-    try:
-        for name in os.listdir('/sys/class/net'):
-            try:
-                with open(f'/sys/class/net/{name}/address', 'r') as f:
-                    mac = f.read().strip().lower()
-                    if mac:
-                        macs.add(mac)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return macs
-
-# compute once at module import; if interfaces change you can call this again
-_LOCAL_MACS = _get_local_macs()
 
 def print_handler(frame, raw, addr):
     if frame is None:
         print("Could not parse frame; raw len=", len(raw))
         return
-
     # Only show Link-Chat frames (our ethertype 0x88b5)
     try:
         eth = frame.ethertype_int()
@@ -117,38 +97,18 @@ def print_handler(frame, raw, addr):
         print(frame)
         return
 
-    LINKCHAT_ETHERTYPE = 0x88b5
+    LINKCHAT_ETHERTYPE = ETH_CHAT
     if eth != LINKCHAT_ETHERTYPE:
         # ignore other traffic by default
         return
-
-    # Quick self-filter: ignore frames originated on this host (prevent processing own sends)
-    try:
-        src_mac = frame.src_mac_str().lower()
-        if src_mac in _LOCAL_MACS:
-            # It's a frame we ourselves sent — ignore to avoid loopback/double-processing.
-            return
-    except Exception:
-        # if something goes wrong getting MAC, continue to normal processing
-        pass
-
     # If it's our Link-Chat frame, inspect payload to see if it's text or file protocol
     payload = frame.payload
     if not payload:
         return
 
-    # Suppress logging for ACK-only frames (they are handled at protocol level)
-    try:
-        msg_type_peek = payload[0]
-        if msg_type_peek == 4:  # MSG_FILE_ACK
-            # we don't print ACK spam; still allow ACK handling elsewhere if needed
-            return
-    except Exception:
-        pass
-
     msg_type = payload[0]
     # File transfer protocol
-    if msg_type == 1:  # FILE_START
+    if msg_type == MSG_FILE_START:  # FILE_START
         # new payload: type(1)=1 | transfer_id(4) | filename_len(1) | filename | filesize(8) | sha256(32)
         min_len = 1 + 4 + 1 + 8 + 32
         if len(payload) < min_len:
@@ -165,17 +125,28 @@ def print_handler(frame, raw, addr):
         safe_name = name.replace('/', '_')
         tmpname = f".receiving.{transfer_id:08x}.{safe_name}"
         outpath = os.path.join(RECEIVE_DIR, tmpname)
-        # open a file for streaming write (random-access not required if sender uses ACKs)
+        # create file of correct size and open in r+b for random-access writes
         try:
             fh = open(outpath, 'wb')
+            fh.truncate(filesize)
+            fh.close()
+            fh = open(outpath, 'r+b')
         except Exception as e:
             print('Cannot open file for writing:', e)
             return
-        RECV_STATE[key] = {'fileobj': fh, 'last_seq': 0, 'filesize': filesize, 'outpath': outpath, 'filename': name, 'expected_hash': expected_hash, 'received_seqs': set(), 'chunks': {}}
+        RECV_STATE[key] = {
+            'fileobj': fh,
+            'last_seq': 0,
+            'filesize': filesize,
+            'outpath': outpath,
+            'filename': name,
+            'expected_hash': expected_hash,
+            'received_seqs': set()
+        }
         print(f"Receiving file start from {frame.src_mac_str()}: {name} ({filesize} bytes) transfer_id={transfer_id:08x} -> {outpath}")
         return
 
-    if msg_type == 2:  # FILE_CHUNK
+    if msg_type == MSG_FILE_CHUNK:  # FILE_CHUNK
         # payload: type(1)=2 | transfer_id(4) | seq(4) | data...
         if len(payload) < 1 + 4 + 4:
             print('Malformed FILE_CHUNK')
@@ -190,25 +161,21 @@ def print_handler(frame, raw, addr):
             print('Received FILE_CHUNK but no FILE_START seen for transfer', transfer_id)
             return
         try:
-            # Save chunk into an in-memory buffer map keyed by seq so we handle out-of-order arrival
-            state['chunks'][seq] = data
+            # random-access write at (seq-1)*CHUNK_SIZE
+            offset = (seq - 1) * CHUNK_SIZE
+            fh = state['fileobj']
+            fh.seek(offset)
+            fh.write(data)
+            fh.flush()
             state['last_seq'] = max(state.get('last_seq', 0), seq)
             state['received_seqs'].add(seq)
         except Exception as e:
-            print('Error storing chunk:', e)
+            print('Error writing chunk:', e)
             return
 
-        # send ACK for this seq back to sender (best-effort)
+        # send ACK for this seq back to sender
         try:
-            iface = None
-            # try to infer an interface to send ACK from by matching a local MAC to one of the system interfaces
-            # fall back to using the first interface discovered earlier
-            try:
-                # try to find an interface whose MAC matches one of our local MACs (best-effort)
-                iface = next(iter([n for n in __import__('os').listdir('/sys/class/net')]), None)
-            except Exception:
-                iface = None
-            iface = iface or 'eth0'
+            iface = RECEIVER_INTERFACE or 'eth0'
             try:
                 local_mac = get_iface_mac(iface)
             except Exception:
@@ -216,12 +183,11 @@ def print_handler(frame, raw, addr):
             ack_payload = bytes([MSG_FILE_ACK]) + struct.pack('!I', transfer_id) + struct.pack('!I', seq)
             ack_frame = Frame(frame.src_mac, local_mac, ETH_CHAT, ack_payload)
             send_frame(ack_frame.to_bytes(), interface=iface)
-        except Exception:
-            # don't crash on ACK failures
-            pass
+        except Exception as e:
+            print("Failed to send ACK:", e)
         return
 
-    if msg_type == 3:  # FILE_END
+    if msg_type == MSG_FILE_END:  # FILE_END
         # payload: type(1)=3 | transfer_id(4) | seq(4)
         if len(payload) < 1 + 4 + 4:
             print('Malformed FILE_END')
@@ -234,19 +200,13 @@ def print_handler(frame, raw, addr):
             print('Received FILE_END but no FILE_START seen for transfer', transfer_id)
             return
         state = RECV_STATE.pop(key)
-        # finalize file by writing chunks in order
+        # finalize file
+        fh = state.get('fileobj')
         outpath = state.get('outpath')
         filename = state.get('filename')
         expected_hash = state.get('expected_hash')
-        chunks = state.get('chunks', {})
         try:
-            with open(outpath, 'wb') as outfh:
-                for i in range(1, last_seq + 1):
-                    piece = chunks.get(i)
-                    if piece is None:
-                        # missing chunk -> we'll treat as failure
-                        raise IOError(f"Missing chunk {i}")
-                    outfh.write(piece)
+            fh.close()
             # compute sha256
             h = hashlib.sha256()
             with open(outpath, 'rb') as rf:
@@ -255,13 +215,14 @@ def print_handler(frame, raw, addr):
             got = h.digest()
             if expected_hash == got:
                 final_path = os.path.join(RECEIVE_DIR, filename)
+                # if final_path exists, append transfer id to avoid overwrite
                 if os.path.exists(final_path):
                     final_path = os.path.join(RECEIVE_DIR, f"{transfer_id:08x}.{filename}")
                 try:
                     os.rename(outpath, final_path)
                 except Exception:
                     final_path = outpath
-                print(f"Received file {filename} from {src} -> saved to {final_path} ({last_seq} chunks) sha256 ok")
+                print(f"Received file {filename} from {src} -> saved to {final_path} ({state.get('last_seq',0)} chunks) sha256 ok")
             else:
                 failed_path = os.path.join(RECEIVE_DIR, f"failed.{transfer_id:08x}.{filename}")
                 try:
@@ -270,15 +231,6 @@ def print_handler(frame, raw, addr):
                     failed_path = outpath
                 print(f"Received file {filename} from {src} -> sha256 MISMATCH, saved as {failed_path}")
         except Exception as e:
-            # write partial file for debugging
-            try:
-                partial = os.path.join(RECEIVE_DIR, f"partial.{transfer_id:08x}.{filename}")
-                with open(partial, 'wb') as outfh:
-                    for i in sorted(chunks):
-                        outfh.write(chunks[i])
-                print(f"Transfer incomplete: wrote partial to {partial}: {e}")
-            except Exception:
-                pass
             print('Error finalizing received file:', e)
         return
 
