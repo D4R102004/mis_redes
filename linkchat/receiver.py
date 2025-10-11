@@ -1,9 +1,12 @@
+# receiver.py (modificado para random-access writes y enviar ACKs)
 import socket
 import sys
 import struct
 import os
 import hashlib
+import fcntl
 from .frame import Frame
+import threading
 
 # receive state for file transfers: key=(src_mac, transfer_id) -> {fileobj, last_seq, filesize, outpath, filename, expected_hash, received_seqs}
 RECV_STATE = {}
@@ -12,14 +15,53 @@ RECV_STATE = {}
 RECEIVE_DIR = '/tmp/linkchat_received'
 os.makedirs(RECEIVE_DIR, exist_ok=True)
 
+# protocol constants
+MSG_FILE_START = 1
+MSG_FILE_CHUNK = 2
+MSG_FILE_END = 3
+MSG_FILE_ACK = 4
+
+CHUNK_SIZE = 1400
+ETH_CHAT = 0x88b5
+
+# receiver interface (set by receive_frames)
+RECEIVER_INTERFACE = None
+
+
+def get_iface_mac(ifname):
+    """Return MAC string for interface (Linux ioctl SIOCGIFHWADDR)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        info = fcntl.ioctl(s.fileno(), 0x8927, struct.pack('256s', ifname.encode('utf-8')[:15]))
+        mac = info[18:24]
+        # format
+        return ":".join(f"{b:02x}" for b in mac)
+    finally:
+        s.close()
+
+
+def send_frame(frame_bytes, interface="eth0"):
+    """Send raw frame bytes on the given interface (used for ACKs)."""
+    if sys.platform != 'linux':
+        raise RuntimeError("Raw AF_PACKET sockets are only supported on Linux")
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+    try:
+        s.bind((interface, 0))
+        s.send(frame_bytes)
+    finally:
+        s.close()
+
 
 def receive_frames(interface="eth0", handler=None):
     """Listen for raw link-layer frames on interface and call handler(frame, addr).
 
     handler is a callable that receives a Frame instance and the raw addr.
     """
+    global RECEIVER_INTERFACE
     if sys.platform != 'linux':
         raise RuntimeError("Raw AF_PACKET sockets are only supported on Linux")
+
+    RECEIVER_INTERFACE = interface
 
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
     try:
@@ -55,7 +97,7 @@ def print_handler(frame, raw, addr):
         print(frame)
         return
 
-    LINKCHAT_ETHERTYPE = 0x88b5
+    LINKCHAT_ETHERTYPE = ETH_CHAT
     if eth != LINKCHAT_ETHERTYPE:
         # ignore other traffic by default
         return
@@ -66,7 +108,7 @@ def print_handler(frame, raw, addr):
 
     msg_type = payload[0]
     # File transfer protocol
-    if msg_type == 1:  # FILE_START
+    if msg_type == MSG_FILE_START:  # FILE_START
         # new payload: type(1)=1 | transfer_id(4) | filename_len(1) | filename | filesize(8) | sha256(32)
         min_len = 1 + 4 + 1 + 8 + 32
         if len(payload) < min_len:
@@ -83,16 +125,28 @@ def print_handler(frame, raw, addr):
         safe_name = name.replace('/', '_')
         tmpname = f".receiving.{transfer_id:08x}.{safe_name}"
         outpath = os.path.join(RECEIVE_DIR, tmpname)
-        # open a file for streaming write
+        # create file of correct size and open in r+b for random-access writes
         try:
             fh = open(outpath, 'wb')
+            fh.truncate(filesize)
+            fh.close()
+            fh = open(outpath, 'r+b')
         except Exception as e:
             print('Cannot open file for writing:', e)
             return
-        RECV_STATE[key] = {'fileobj': fh, 'last_seq': 0, 'filesize': filesize, 'outpath': outpath, 'filename': name, 'expected_hash': expected_hash, 'received_seqs': set()}
+        RECV_STATE[key] = {
+            'fileobj': fh,
+            'last_seq': 0,
+            'filesize': filesize,
+            'outpath': outpath,
+            'filename': name,
+            'expected_hash': expected_hash,
+            'received_seqs': set()
+        }
         print(f"Receiving file start from {frame.src_mac_str()}: {name} ({filesize} bytes) transfer_id={transfer_id:08x} -> {outpath}")
         return
-    if msg_type == 2:  # FILE_CHUNK
+
+    if msg_type == MSG_FILE_CHUNK:  # FILE_CHUNK
         # payload: type(1)=2 | transfer_id(4) | seq(4) | data...
         if len(payload) < 1 + 4 + 4:
             print('Malformed FILE_CHUNK')
@@ -107,16 +161,33 @@ def print_handler(frame, raw, addr):
             print('Received FILE_CHUNK but no FILE_START seen for transfer', transfer_id)
             return
         try:
-            # write chunk at current file end (chunks are appended). For robustness
-            # we track received seqs in a set; this simple implementation assumes
-            # chunks arrive in order but will record seqs regardless.
-            state['fileobj'].write(data)
-            state['last_seq'] = seq
+            # random-access write at (seq-1)*CHUNK_SIZE
+            offset = (seq - 1) * CHUNK_SIZE
+            fh = state['fileobj']
+            fh.seek(offset)
+            fh.write(data)
+            fh.flush()
+            state['last_seq'] = max(state.get('last_seq', 0), seq)
             state['received_seqs'].add(seq)
         except Exception as e:
             print('Error writing chunk:', e)
+            return
+
+        # send ACK for this seq back to sender
+        try:
+            iface = RECEIVER_INTERFACE or 'eth0'
+            try:
+                local_mac = get_iface_mac(iface)
+            except Exception:
+                local_mac = '00:00:00:00:00:00'
+            ack_payload = bytes([MSG_FILE_ACK]) + struct.pack('!I', transfer_id) + struct.pack('!I', seq)
+            ack_frame = Frame(frame.src_mac, local_mac, ETH_CHAT, ack_payload)
+            send_frame(ack_frame.to_bytes(), interface=iface)
+        except Exception as e:
+            print("Failed to send ACK:", e)
         return
-    if msg_type == 3:  # FILE_END
+
+    if msg_type == MSG_FILE_END:  # FILE_END
         # payload: type(1)=3 | transfer_id(4) | seq(4)
         if len(payload) < 1 + 4 + 4:
             print('Malformed FILE_END')
