@@ -8,6 +8,7 @@ import fcntl
 from .frame import Frame
 import threading
 from .discovery import ETH_DISCOVERY, handle_discovery_frame
+import tarfile
 
 
 # receive state for file transfers: key=(src_mac, transfer_id) -> {fileobj, last_seq, filesize, outpath, filename, expected_hash, received_seqs}
@@ -280,6 +281,8 @@ def print_handler(frame, raw, addr):
                 except Exception:
                     final_path = outpath
                 print(f"Received file {filename} from {src} -> saved to {final_path} ({last_seq} chunks) sha256 ok")
+                # Automatically extract .tar folders
+                extract_if_tar(final_path, RECEIVE_DIR)
             else:
                 failed_path = os.path.join(RECEIVE_DIR, f"failed.{transfer_id:08x}.{filename}")
                 try:
@@ -305,6 +308,26 @@ def print_handler(frame, raw, addr):
         print(f"LinkChat message from {frame.src_mac_str()} -> {frame.dst_mac_str()}: {text}")
     except Exception:
         print(f"LinkChat frame from {frame.src_mac_str()} -> {frame.dst_mac_str()}, payload bytes:", payload)
+
+
+def extract_if_tar(final_path, receive_dir):
+    """Extracts a .tar archive directly into receive_dir, without nested folders."""
+    if not final_path.endswith(".tar"):
+        return
+
+    try:
+        with tarfile.open(final_path, "r") as tf:
+            # Prevent path traversal attacks
+            for member in tf.getmembers():
+                member_path = os.path.join(receive_dir, member.name)
+                if not os.path.realpath(member_path).startswith(os.path.realpath(receive_dir) + os.sep):
+                    raise Exception(f"Insecure path detected: {member.name}")
+            tf.extractall(receive_dir)
+        print(f"[Link-Chat] Extracted folder contents into {receive_dir}")
+        os.remove(final_path)
+    except Exception as e:
+        print(f"[Link-Chat] Failed to extract {final_path}: {e}")
+
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
