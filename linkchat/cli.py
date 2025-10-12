@@ -148,6 +148,19 @@ class CLI:
                 except Exception as e:
                     print('send-file error:', e)
                 continue
+            if c == 'send-folder':
+                if len(parts) < 3:
+                    print('Usage: send-folder <mac> <folderpath>')
+                    continue
+                dst = parts[1]
+                folder = parts[2]
+                try:
+                    from .sender import send_folder
+                    send_folder(dst, self.iface_mac, folder, interface=self.iface)
+                    print('Folder send launched')
+                except Exception as e:
+                    print('send-folder error:', e)
+                continue
             if c == "discover":
                 if not self.iface:
                     print("Select interface first")

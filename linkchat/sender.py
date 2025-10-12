@@ -10,6 +10,9 @@ import random
 import threading
 import time
 import math
+import tarfile
+import tempfile
+import shutil
 
 # File transfer message types
 MSG_FILE_START = 1
@@ -259,6 +262,32 @@ def send_file(dst_mac, src_mac, filepath, interface="eth0"):
         except Exception:
             pass
 
+def send_folder(dst_mac, src_mac, folder_path, interface=None):
+    """
+    Empaqueta una carpeta completa en .tar y la envía como un solo archivo.
+    La carpeta se recreará automáticamente al recibir.
+    """
+    from .sender import send_file  # importación local para evitar loops
+
+    if not os.path.isdir(folder_path):
+        raise ValueError(f"{folder_path} no es una carpeta válida")
+
+    folder_name = os.path.basename(os.path.abspath(folder_path))
+    temp_dir = tempfile.mkdtemp(prefix="linkchat_tar_")
+    tar_path = os.path.join(temp_dir, folder_name + ".tar")
+
+    try:
+        print(f"[Link-Chat] Empaquetando carpeta '{folder_name}'...")
+        with tarfile.open(tar_path, "w") as tar:
+            tar.add(folder_path, arcname=folder_name)
+        print(f"[Link-Chat] Carpeta empaquetada como {tar_path}")
+
+        # Reutilizamos el envío de archivos
+        send_file(dst_mac, src_mac, tar_path, interface=interface)
+        print(f"[Link-Chat] Carpeta '{folder_name}' enviada exitosamente")
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == '__main__':
     # Simple CLI: send message to dst_mac
