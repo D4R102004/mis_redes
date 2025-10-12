@@ -186,6 +186,15 @@ def send_file(dst_mac, src_mac, filepath, interface="eth0"):
     # ensure ack-listener running
     _start_ack_listener(interface)
 
+    # send a tiny probe so the bridge learns the dst MAC (best-effort)
+    try:
+        probe = Frame(dst_mac, src_mac, ETH_CHAT, b'LINKCHAT-PROBE')
+        send_frame(probe.to_bytes(), interface=interface)
+        time.sleep(0.02)  # 20 ms
+    except Exception:
+        pass
+
+
     # Send FILE_START
     start_payload = (bytes([MSG_FILE_START]) + struct.pack('!I', transfer_id) +
                      bytes([len(name_bytes)]) + name_bytes + struct.pack('!Q', filesize) + digest)

@@ -115,6 +115,10 @@ def _is_multicast(mac_str):
         return False
 # -------------------------------------------------------------------------------
 
+# compute once at module import; if interfaces change you can call this again
+_LOCAL_MACS = _get_local_macs()
+
+# Replace the existing print_handler with this:
 def print_handler(frame, raw, addr):
     if frame is None:
         print("Could not parse frame; raw len=", len(raw))
