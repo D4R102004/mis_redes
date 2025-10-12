@@ -7,6 +7,8 @@ import hashlib
 import fcntl
 from .frame import Frame
 import threading
+from .discovery import ETH_DISCOVERY, handle_discovery_frame
+
 
 # receive state for file transfers: key=(src_mac, transfer_id) -> {fileobj, last_seq, filesize, outpath, filename, expected_hash, received_seqs}
 RECV_STATE = {}
@@ -125,12 +127,22 @@ def print_handler(frame, raw, addr):
     except Exception:
         print(frame)
         return
+    
+    # If this frame is a discovery frame, hand off to discovery module
+    if eth == ETH_DISCOVERY:
+        # pass Frame + interface name so discovery can reply using the right interface
+        try:
+            handle_discovery_frame(frame, RECEIVER_INTERFACE or 'eth0')
+        except Exception as e:
+            # avoid crashing receiver on discovery errors
+            print("Discovery handler error:", e)
+        return
 
     LINKCHAT_ETHERTYPE = 0x88b5
     if eth != LINKCHAT_ETHERTYPE:
         # ignore other traffic by default
         return
-
+    
     # Source and destination MACs
     try:
         src_mac = frame.src_mac_str().lower()

@@ -13,6 +13,11 @@ import socket
 import fcntl
 import struct
 import time
+# remove: from .discovery import send_text, ETH_DISCOVERY, DISCOVER, peer_table
+from .discovery import ETH_DISCOVERY, send_discover_broadcast, peer_table
+from .sender import send_text  # sender's send_text is the packet sender
+import json
+
 
 from .frame import mac_bytes_to_str
 from .receiver import receive_frames, print_handler
@@ -143,7 +148,28 @@ class CLI:
                 except Exception as e:
                     print('send-file error:', e)
                 continue
-            print('Unknown command: ', c)
+            if c == "discover":
+                if not self.iface:
+                    print("Select interface first")
+                    continue
+                # send a single broadcast discovery; peers will reply with HELLO
+                try:
+                    send_discover_broadcast(self.iface)
+                except Exception as e:
+                    print("Discovery send failed:", e)
+                    continue
+                print("Discovery broadcast sent. Waiting for replies...")
+                # wait a short time to collect replies (non-busy; sleep in main thread is OK here)
+                time.sleep(2.0)
+                peers = peer_table.get_active(timeout=10)
+                if not peers:
+                    print("No peers found.")
+                else:
+                    print("Peers discovered:")
+                    for mac, (name, seen) in peers.items():
+                        age = int(time.time() - seen)
+                        print(f"  {name} ({mac}) - seen {age}s ago")
+                continue
 
 
 def main():
