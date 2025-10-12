@@ -15,7 +15,7 @@ sudo docker compose -f "$COMPOSE_FILE" up -d
 sleep 2
 
 echo "Creating test file and copying to nodeB..."
-echo "Prueba de archivo desde nodeB" > /tmp/testfile_for_transfer.txt
+echo "Prueba de archivo desde nodeB malaria" > /tmp/testfile_for_transfer.txt
 docker cp /tmp/testfile_for_transfer.txt linkchat_node_b:/tmp/testfile_for_transfer.txt
 
 echo "Start receiver in nodeA (background)..."
@@ -28,7 +28,7 @@ echo "nodeA MAC: $MAC_A"
 echo "Trigger send-file from nodeB..."
 docker exec linkchat_node_b sh -c "python3 -u -m linkchat.cli <<'CLI'
 iface
-0
+1
 send-file $MAC_A /tmp/testfile_for_transfer.txt
 exit
 CLI"
@@ -39,7 +39,7 @@ echo "Receiver log:"
 docker exec linkchat_node_a sh -c "tail -n 200 /tmp/rcv_file.log || true"
 
 echo "Received file content (on nodeA):"
-docker exec linkchat_node_a sh -c "cat /tmp/received_testfile_for_transfer.txt || echo 'No file found'"
+docker exec linkchat_node_a sh -c "cat /tmp/linkchat_received/testfile_for_transfer.txt || echo 'No file found'"
 
 echo "Tearing down..."
 sudo docker compose -f "$COMPOSE_FILE" down
