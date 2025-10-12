@@ -85,35 +85,6 @@ def receive_frames(interface="eth0", handler=None):
     finally:
         s.close()
 
-# --- add near top of receiver.py ------------------------------------------------
-def _get_local_macs():
-    """Return a set of local MAC addresses (lowercase) from /sys/class/net."""
-    macs = set()
-    try:
-        for name in __import__('os').listdir('/sys/class/net'):
-            try:
-                with open(f'/sys/class/net/{name}/address', 'r') as f:
-                    mac = f.read().strip().lower()
-                    if mac:
-                        macs.add(mac)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return macs
-
-_LOCAL_MACS = _get_local_macs()
-
-def _is_broadcast(mac_str):
-    return mac_str.lower() == 'ff:ff:ff:ff:ff:ff'
-
-def _is_multicast(mac_str):
-    try:
-        first_octet = int(mac_str.split(':')[0], 16)
-        return (first_octet & 0x01) == 1
-    except Exception:
-        return False
-# -------------------------------------------------------------------------------
 
 def print_handler(frame, raw, addr):
     if frame is None:
@@ -126,47 +97,19 @@ def print_handler(frame, raw, addr):
         print(frame)
         return
 
-    LINKCHAT_ETHERTYPE = 0x88b5
+    LINKCHAT_ETHERTYPE = ETH_CHAT
     if eth != LINKCHAT_ETHERTYPE:
         # ignore other traffic by default
         return
-
-    # Source and destination MACs
-    try:
-        src_mac = frame.src_mac_str().lower()
-    except Exception:
-        src_mac = None
-    try:
-        dst_mac = frame.dst_mac_str().lower()
-    except Exception:
-        dst_mac = None
-
-    # 1) Ignore frames we sent ourselves (prevents self-loop processing)
-    if src_mac and src_mac in _LOCAL_MACS:
-        return
-
-    # 2) Ignore frames that are not addressed to this host and are not broadcast/multicast.
-    #    This prevents containers/hosts from processing frames that the bridge flooded to them.
-    if dst_mac:
-        if not (_is_broadcast(dst_mac) or _is_multicast(dst_mac) or dst_mac in _LOCAL_MACS):
-            # Not for us, ignore silently
-            return
-
     # If it's our Link-Chat frame, inspect payload to see if it's text or file protocol
     payload = frame.payload
     if not payload:
         return
 
-    # Optionally suppress ACK-only prints (type 4)
-    try:
-        if payload[0] == 4:  # MSG_FILE_ACK
-            return
-    except Exception:
-        pass
-
     msg_type = payload[0]
     # File transfer protocol
-    if msg_type == 1:  # FILE_START
+    if msg_type == MSG_FILE_START:  # FILE_START
+        # new payload: type(1)=1 | transfer_id(4) | filename_len(1) | filename | filesize(8) | sha256(32)
         min_len = 1 + 4 + 1 + 8 + 32
         if len(payload) < min_len:
             print('Malformed FILE_START')
@@ -176,22 +119,35 @@ def print_handler(frame, raw, addr):
         name = payload[6:6+name_len].decode('utf-8')
         filesize = struct.unpack('!Q', payload[6+name_len:6+name_len+8])[0]
         expected_hash = payload[6+name_len+8:6+name_len+8+32]
+        # initialize reassembly state in global dict keyed by src_mac + transfer_id
         key = (frame.src_mac_str(), transfer_id)
+        # create unique temp filename
         safe_name = name.replace('/', '_')
         tmpname = f".receiving.{transfer_id:08x}.{safe_name}"
         outpath = os.path.join(RECEIVE_DIR, tmpname)
+        # create file of correct size and open in r+b for random-access writes
         try:
             fh = open(outpath, 'wb')
+            fh.truncate(filesize)
+            fh.close()
+            fh = open(outpath, 'r+b')
         except Exception as e:
             print('Cannot open file for writing:', e)
             return
-        RECV_STATE[key] = {'fileobj': fh, 'last_seq': 0, 'filesize': filesize,
-                           'outpath': outpath, 'filename': name, 'expected_hash': expected_hash,
-                           'received_seqs': set(), 'chunks': {}}
+        RECV_STATE[key] = {
+            'fileobj': fh,
+            'last_seq': 0,
+            'filesize': filesize,
+            'outpath': outpath,
+            'filename': name,
+            'expected_hash': expected_hash,
+            'received_seqs': set()
+        }
         print(f"Receiving file start from {frame.src_mac_str()}: {name} ({filesize} bytes) transfer_id={transfer_id:08x} -> {outpath}")
         return
 
-    if msg_type == 2:  # FILE_CHUNK
+    if msg_type == MSG_FILE_CHUNK:  # FILE_CHUNK
+        # payload: type(1)=2 | transfer_id(4) | seq(4) | data...
         if len(payload) < 1 + 4 + 4:
             print('Malformed FILE_CHUNK')
             return
@@ -202,36 +158,37 @@ def print_handler(frame, raw, addr):
         key = (src, transfer_id)
         state = RECV_STATE.get(key)
         if state is None:
-            # not our transfer
+            print('Received FILE_CHUNK but no FILE_START seen for transfer', transfer_id)
             return
         try:
-            state['chunks'][seq] = data
+            # random-access write at (seq-1)*CHUNK_SIZE
+            offset = (seq - 1) * CHUNK_SIZE
+            fh = state['fileobj']
+            fh.seek(offset)
+            fh.write(data)
+            fh.flush()
             state['last_seq'] = max(state.get('last_seq', 0), seq)
             state['received_seqs'].add(seq)
         except Exception as e:
-            print('Error storing chunk:', e)
+            print('Error writing chunk:', e)
             return
-        # send ACK (best-effort) using same interface as receiver was bound to if possible
+
+        # send ACK for this seq back to sender
         try:
-            iface = addr[0] if isinstance(addr, tuple) and addr else None
-        except Exception:
-            iface = None
-        # best-effort ACK using any available interface (you may keep original behaviour)
-        try:
-            # pick a local interface name heuristically
-            iface_name = next(iter(__import__('os').listdir('/sys/class/net')), 'eth0')
+            iface = RECEIVER_INTERFACE or 'eth0'
             try:
-                local_mac = get_iface_mac(iface_name)
+                local_mac = get_iface_mac(iface)
             except Exception:
                 local_mac = '00:00:00:00:00:00'
             ack_payload = bytes([MSG_FILE_ACK]) + struct.pack('!I', transfer_id) + struct.pack('!I', seq)
             ack_frame = Frame(frame.src_mac, local_mac, ETH_CHAT, ack_payload)
-            send_frame(ack_frame.to_bytes(), interface=iface_name)
-        except Exception:
-            pass
+            send_frame(ack_frame.to_bytes(), interface=iface)
+        except Exception as e:
+            print("Failed to send ACK:", e)
         return
 
-    if msg_type == 3:  # FILE_END
+    if msg_type == MSG_FILE_END:  # FILE_END
+        # payload: type(1)=3 | transfer_id(4) | seq(4)
         if len(payload) < 1 + 4 + 4:
             print('Malformed FILE_END')
             return
@@ -243,31 +200,29 @@ def print_handler(frame, raw, addr):
             print('Received FILE_END but no FILE_START seen for transfer', transfer_id)
             return
         state = RECV_STATE.pop(key)
+        # finalize file
+        fh = state.get('fileobj')
         outpath = state.get('outpath')
         filename = state.get('filename')
         expected_hash = state.get('expected_hash')
-        chunks = state.get('chunks', {})
         try:
-            with open(outpath, 'wb') as outfh:
-                for i in range(1, last_seq + 1):
-                    piece = chunks.get(i)
-                    if piece is None:
-                        raise IOError(f"Missing chunk {i}")
-                    outfh.write(piece)
+            fh.close()
+            # compute sha256
             h = hashlib.sha256()
             with open(outpath, 'rb') as rf:
-                for ch in iter(lambda: rf.read(8192), b''):
-                    h.update(ch)
+                for chunk in iter(lambda: rf.read(8192), b''):
+                    h.update(chunk)
             got = h.digest()
             if expected_hash == got:
                 final_path = os.path.join(RECEIVE_DIR, filename)
+                # if final_path exists, append transfer id to avoid overwrite
                 if os.path.exists(final_path):
                     final_path = os.path.join(RECEIVE_DIR, f"{transfer_id:08x}.{filename}")
                 try:
                     os.rename(outpath, final_path)
                 except Exception:
                     final_path = outpath
-                print(f"Received file {filename} from {src} -> saved to {final_path} ({last_seq} chunks) sha256 ok")
+                print(f"Received file {filename} from {src} -> saved to {final_path} ({state.get('last_seq',0)} chunks) sha256 ok")
             else:
                 failed_path = os.path.join(RECEIVE_DIR, f"failed.{transfer_id:08x}.{filename}")
                 try:
@@ -276,14 +231,6 @@ def print_handler(frame, raw, addr):
                     failed_path = outpath
                 print(f"Received file {filename} from {src} -> sha256 MISMATCH, saved as {failed_path}")
         except Exception as e:
-            try:
-                partial = os.path.join(RECEIVE_DIR, f"partial.{transfer_id:08x}.{filename}")
-                with open(partial, 'wb') as outfh:
-                    for i in sorted(chunks):
-                        outfh.write(chunks[i])
-                print(f"Transfer incomplete: wrote partial to {partial}: {e}")
-            except Exception:
-                pass
             print('Error finalizing received file:', e)
         return
 
@@ -293,6 +240,7 @@ def print_handler(frame, raw, addr):
         print(f"LinkChat message from {frame.src_mac_str()} -> {frame.dst_mac_str()}: {text}")
     except Exception:
         print(f"LinkChat frame from {frame.src_mac_str()} -> {frame.dst_mac_str()}, payload bytes:", payload)
+
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
