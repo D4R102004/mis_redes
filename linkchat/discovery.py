@@ -66,7 +66,17 @@ def handle_discovery_frame(frame, iface):
         return
 
     typ = data.get("type")
-    src_mac = frame.src_mac_str()
+    src_mac = frame.src_mac_str().lower()
+
+    # get our local MAC on that iface to avoid replying to / recording ourselves
+    try:
+        local_mac = _get_iface_mac(iface).lower()
+    except Exception:
+        local_mac = None
+
+    # don't process frames that allegedly come from ourselves
+    if local_mac and src_mac == local_mac:
+        return
 
     if typ == MSG_DISCOVER:
         # someone asked "who's there?" — reply with HELLO unicast
@@ -74,12 +84,23 @@ def handle_discovery_frame(frame, iface):
         reply = json.dumps({"type": MSG_HELLO, "name": myname})
         try:
             # send_text(dst_mac, src_mac, ethertype, text, interface)
-            local_mac = _get_iface_mac(iface)
-            send_text(src_mac, local_mac, ETH_DISCOVERY, reply, interface=iface)
+            local_mac_send = _get_iface_mac(iface)
+            send_text(src_mac, local_mac_send, ETH_DISCOVERY, reply, interface=iface)
             print(f"[DISCOVERY] Replied HELLO to {src_mac} (requester: {data.get('name')})")
         except Exception as e:
             print("[DISCOVERY] Failed to reply HELLO:", e)
         return
+
+    if typ == MSG_HELLO:
+        # record peer
+        peer_name = data.get("name", "?")
+        # ensure we don't record ourselves
+        if local_mac and src_mac == local_mac:
+            return
+        peer_table.update(src_mac, peer_name)
+        print(f"[DISCOVERY] HELLO from {src_mac} -> {peer_name}")
+        return
+
 
     if typ == MSG_HELLO:
         # record peer

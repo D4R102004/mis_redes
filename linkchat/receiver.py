@@ -230,18 +230,15 @@ def print_handler(frame, raw, addr):
         except Exception:
             iface = None
         # best-effort ACK using any available interface (you may keep original behaviour)
+        # --- send ACK (best-effort) ---
         try:
-            # pick a local interface name heuristically
-            iface_name = next(iter(__import__('os').listdir('/sys/class/net')), 'eth0')
-            try:
-                local_mac = get_iface_mac(iface_name)
-            except Exception:
-                local_mac = '00:00:00:00:00:00'
+            local_iface = RECEIVER_INTERFACE or 'eth0'
+            local_mac = get_iface_mac(local_iface)
             ack_payload = bytes([MSG_FILE_ACK]) + struct.pack('!I', transfer_id) + struct.pack('!I', seq)
-            ack_frame = Frame(frame.src_mac, local_mac, ETH_CHAT, ack_payload)
-            send_frame(ack_frame.to_bytes(), interface=iface_name)
-        except Exception:
-            pass
+            ack_frame = Frame(frame.dst_mac, local_mac, ETH_CHAT, ack_payload)
+            send_frame(ack_frame.to_bytes(), interface=local_iface)
+        except Exception as e:
+            print(f"ACK send error for chunk {seq}: {e}")
         return
 
     if msg_type == 3:  # FILE_END
@@ -327,6 +324,8 @@ def extract_if_tar(final_path, receive_dir):
         os.remove(final_path)
     except Exception as e:
         print(f"[Link-Chat] Failed to extract {final_path}: {e}")
+
+
 
 
 if __name__ == '__main__':
