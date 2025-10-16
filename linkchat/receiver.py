@@ -235,7 +235,7 @@ def print_handler(frame, raw, addr):
             local_iface = RECEIVER_INTERFACE or 'eth0'
             local_mac = get_iface_mac(local_iface)
             ack_payload = bytes([MSG_FILE_ACK]) + struct.pack('!I', transfer_id) + struct.pack('!I', seq)
-            ack_frame = Frame(frame.dst_mac, local_mac, ETH_CHAT, ack_payload)
+            ack_frame = Frame(frame.src_mac, local_mac, ETH_CHAT, ack_payload)
             send_frame(ack_frame.to_bytes(), interface=local_iface)
         except Exception as e:
             print(f"ACK send error for chunk {seq}: {e}")
